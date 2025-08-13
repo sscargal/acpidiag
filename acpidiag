@@ -1,0 +1,810 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import subprocess
+import shutil
+import re
+from typing import List, Dict, Optional, Tuple
+
+# CXL Specification Definitions (Section 9.18.1 for CEDT)
+CXL_RESTRICTIONS = {
+    0x0: "Reserved",
+    0x1: "Device Coherent",
+    0x2: "Host-Only Coherent",
+    0x4: "Volatile",
+    0x8: "Persistent",
+    0x10: "In-Band BI",
+    0x20: "Back-Invalidate (BI) Enabled",
+}
+
+# HMAT Specification Definitions (ACPI 6.4 Specification, Section 5.2.22)
+HMAT_SUBTABLE_TYPES = {
+    0: "Memory Proximity Domain Attribute Structure",
+    1: "Processor Proximity Domain Affinity Structure",
+    2: "Memory Proximity Domain attribute Extensibility Structure",
+    3: "System Physical Address Range Structure",
+}
+
+# PMTT Specification Definitions (ACPI 6.4 Specification, Section 5.2.23)
+PMTT_SUBTABLE_TYPES = {
+    0: "Memory Controller Structure",
+    1: "Memory Device Structure",
+    2: "Physical Component (DIMM)",
+    255: "Vendor Specific Subtable",
+}
+PMTT_DEVICE_TYPES = {
+    0: "Unknown",
+    1: "DRAM",
+    2: "NVDIMM",
+    3: "CXL Memory",
+}
+PMTT_ATTRIBUTES = {
+    0x1: "Volatile",
+    0x2: "Byte-Addressable Persistent",
+    0x4: "Word-Addressable Persistent",
+}
+
+class ACPIDecoder:
+    def __init__(self, acpidump_path: str, iasl_path: str, working_dir: str):
+        """Initializes the decoder with paths to binaries and a working directory."""
+        self.acpidump_path = acpidump_path
+        self.iasl_path = iasl_path
+        self.working_dir = working_dir
+        self.parsed_data = {}
+
+    def setup_workspace(self) -> None:
+        """Creates a clean working directory for all operations."""
+        if os.path.exists(self.working_dir):
+            shutil.rmtree(self.working_dir)
+        os.makedirs(self.working_dir)
+        print(f"Created a clean working directory at: {self.working_dir}")
+
+    def run_command(self, cmd: List[str]) -> str:
+        """Executes a shell command and returns its output, or prints a user-friendly error message."""
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return result.stdout
+        except FileNotFoundError:
+            print(f"[ERROR] Required binary not found. Please check paths for '{cmd[0]}'.")
+            exit(1)
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] Failed to run: {' '.join(cmd)}")
+            if 'AE_ACCESS' in e.stderr or 'Could not get ACPI tables' in e.stderr:
+                print("[ERROR] Permission denied. Please run this utility as root or with sudo to access ACPI tables.")
+            else:
+                print(f"Stdout: {e.stdout}")
+                print(f"Stderr: {e.stderr}")
+            exit(1)
+
+    def dump_acpi_tables(self, output_file: str) -> None:
+        """Dumps all ACPI tables into a single file."""
+        print(f"Dumping all ACPI tables to {output_file}...")
+        self.run_command([self.acpidump_path, "-o", output_file])
+        print(f"All ACPI tables dumped to {output_file}")
+
+    def get_table_list(self, dump_file: str) -> List[str]:
+        """Lists all ACPI tables available in the dump file using acpixtract -l."""
+        print(f"Listing available ACPI tables from {dump_file}...")
+        output = self.run_command(["acpixtract", "-l", dump_file])
+        # Parse lines with 4-char table signatures
+        table_names = []
+        for line in output.splitlines():
+            match = re.match(r"\s*\d+\)\s+([A-Z0-9]{4})\s", line)
+            if match:
+                table_names.append(match.group(1))
+        return table_names
+
+    def process_tables(self, tables: List[str], dump_file: str, data_key: str) -> None:
+        """Processes and decodes a list of specified ACPI tables for a given dump file."""
+        self.parsed_data[data_key] = {}
+        for table_name in tables:
+            print(f"\n--- Processing table: {table_name} for dump file {dump_file} ---")
+            dat_file = os.path.join(self.working_dir, f"{table_name.lower()}.dat")
+            dsl_file = os.path.join(self.working_dir, f"{table_name.lower()}.dsl")
+            try:
+                # Extract table to .dat file using acpixtract
+                extract_cmd = ["acpixtract", f"-s{table_name}", dump_file]
+                self.run_command(extract_cmd)
+                # Move .dat file to working_dir if not already there
+                import glob
+                found = glob.glob(f"{table_name.lower()}*.dat")
+                for f in found:
+                    if os.path.abspath(os.path.dirname(f)) != os.path.abspath(self.working_dir):
+                        shutil.move(f, dat_file)
+                # Disassemble .dat file with iasl, output to working_dir using -p
+                disassemble_cmd = [self.iasl_path, "-p", os.path.join(self.working_dir, table_name.lower()), "-d", dat_file]
+                self.run_command(disassemble_cmd)
+            except Exception as e:
+                print(f"Failed to extract or disassemble table {table_name}: {e}")
+                continue
+            # Decode CXL and related tables
+            if table_name == "CEDT":
+                self.decode_cedt_table(dsl_file, data_key)
+            elif table_name == "SLIT":
+                self.decode_slit_table(dsl_file, data_key)
+            elif table_name == "HMAT":
+                self.decode_hmat_table(dsl_file, data_key)
+            elif table_name == "PMTT":
+                self.decode_pmtt_table(dsl_file, data_key)
+            else:
+                print(f"No specific decoder for table {table_name}. Disassembled file saved to {dsl_file.replace('.dsl', '.txt')}")
+
+    def run_validation_checks(self, data_key: str) -> None:
+        """Runs a series of validation checks on the decoded ACPI tables."""
+        print("\n" + "="*40)
+        print(f"  Running Validation Checks for {data_key}  ")
+        print("="*40)
+        report = []
+        parsed_data = self.parsed_data[data_key]
+        # Check 1: HBUID Uniqueness
+        if 'CEDT_CHBS' in parsed_data:
+            hbuids = [chbs['hb_id'] for chbs in parsed_data['CEDT_CHBS']]
+            unique_hbuids = set(hbuids)
+            if len(hbuids) == len(unique_hbuids):
+                report.append("✅ [PASS] All Host Bridge UIDs in CEDT are unique.")
+            else:
+                duplicates = {uid: hbuids.count(uid) for uid in hbuids if hbuids.count(uid) > 1}
+                report.append(f"❌ [FAIL] Duplicate Host Bridge UIDs found: {duplicates}. Each Host Bridge UID must be unique per CXL spec.")
+        # Check 2: Interleave Members vs. Next Targets (improved message)
+        if 'CEDT_CFMWS' in parsed_data:
+            for i, cfmws in enumerate(parsed_data['CEDT_CFMWS']):
+                expected_targets = cfmws['interleave_members'] + 1
+                actual_targets = len(cfmws['targets'])
+                if expected_targets == actual_targets:
+                    report.append(f"✅ [PASS] CFMWS #{i+1}: Interleave Members field ({cfmws['interleave_members']}) matches target count ({actual_targets}).")
+                else:
+                    report.append(f"❌ [FAIL] CFMWS #{i+1}: Interleave Member count is inconsistent with Target count. The 'Interleave Members' field (value {cfmws['interleave_members']}) indicates a {expected_targets}-way interleave, but the table lists {actual_targets} target host bridges.")
+        # New Rule: Consecutive Memory Window Address Check
+        if 'CEDT_CFMWS' in parsed_data:
+            cfmws_sorted = sorted(parsed_data['CEDT_CFMWS'], key=lambda x: x.get('window_base', 0))
+            for idx in range(1, len(cfmws_sorted)):
+                prev = cfmws_sorted[idx-1]
+                curr = cfmws_sorted[idx]
+                prev_end = prev.get('window_base', 0) + prev['size_bytes']
+                curr_start = curr.get('window_base', 0)
+                granularity = curr.get('granularity', 0)
+                if granularity == 0 and prev_end != curr_start:
+                    report.append(f"❌ [FAIL] CFMWS #{idx}: Memory window base address is not consecutive. Previous window ends at {hex(prev_end)}, next window starts at {hex(curr_start)}.")
+        # New Rule: XOR Interleave Math Structure Consistency
+        if 'CEDT_CFMWS' in parsed_data and 'CEDT_XOR' in parsed_data:
+            xor_offsets = [xor['offset'] for xor in parsed_data['CEDT_XOR']]
+            for i, cfmws in enumerate(parsed_data['CEDT_CFMWS']):
+                if cfmws['interleave_arithmetic'] == 1:
+                    if not xor_offsets:
+                        report.append(f"❌ [FAIL] CFMWS #{i+1}: Uses XOR Interleave Arithmetic but no corresponding XOR Interleave Math Structure found in CEDT.")
+                    else:
+                        report.append(f"✅ [PASS] CFMWS #{i+1}: XOR Interleave Arithmetic is paired with XOR Interleave Math Structure.")
+        # New Rule: SLIT Distance Matrix Symmetry
+        if 'SLIT_MATRIX' in parsed_data:
+            matrix = parsed_data['SLIT_MATRIX']
+            symmetric = True
+            for i in range(len(matrix)):
+                for j in range(len(matrix)):
+                    if matrix[i][j] != matrix[j][i]:
+                        symmetric = False
+                        report.append(f"❌ [FAIL] SLIT: Distance from Locality {i} to {j} ({matrix[i][j]}) does not match distance from {j} to {i} ({matrix[j][i]}). Matrix should be symmetric.")
+            if symmetric:
+                report.append("✅ [PASS] SLIT: Locality distance matrix is symmetric.")
+        # New Rule: PMTT Memory Controller/Device Count
+        if 'PMTT_MEMDEVICES' in parsed_data:
+            # This is a stub; real implementation would require controller/device hierarchy
+            device_count = len(parsed_data['PMTT_MEMDEVICES'])
+            if device_count > 0:
+                report.append(f"✅ [PASS] PMTT: Found {device_count} memory devices.")
+            else:
+                report.append("❌ [FAIL] PMTT: No memory devices found under any controller.")
+        validation_report_str = "\n".join(report)
+        print(validation_report_str)
+        report_file = os.path.join(self.working_dir, f"validation_report_{data_key}.txt")
+        with open(report_file, 'w') as f:
+            f.write(validation_report_str)
+        print(f"\nValidation report saved to {report_file}")
+        
+    def compare_dumps(self, key1: str, key2: str) -> None:
+        """Compares the parsed data from two ACPI dumps and generates a report."""
+        report = [
+            "============================================",
+            "    ACPI Table Comparison Report            ",
+            "============================================",
+            f"Comparing {key1} vs {key2}\n"
+        ]
+        
+        data1 = self.parsed_data.get(key1, {})
+        data2 = self.parsed_data.get(key2, {})
+
+        all_tables = set(data1.keys()) | set(data2.keys())
+        for table_key in sorted(list(all_tables)):
+            report.append(f"--- Comparing Table: {table_key} ---")
+            
+            table1_exists = table_key in data1
+            table2_exists = table_key in data2
+            
+            if not table1_exists and table2_exists:
+                report.append(f"✅ [FOUND] Table {table_key} exists in {key2} but not in {key1}.")
+            elif table1_exists and not table2_exists:
+                report.append(f"❌ [MISSING] Table {table_key} exists in {key1} but not in {key2}.")
+            else:
+                # Compare the contents of the tables
+                if table_key == 'CEDT_CFMWS':
+                    self._compare_cfmw(data1[table_key], data2[table_key], report, key1, key2)
+                elif table_key == 'CEDT_CHBS':
+                    self._compare_chbs(data1[table_key], data2[table_key], report, key1, key2)
+                elif table_key == 'PMTT_MEMDEVICES':
+                    self._compare_pmtt_devices(data1[table_key], data2[table_key], report, key1, key2)
+                else:
+                    # Simple comparison for other tables
+                    if data1[table_key] != data2[table_key]:
+                        report.append(f"❗ [DIFFERENT] Table {table_key} has differences.")
+                    else:
+                        report.append(f"✅ [SAME] Table {table_key} is identical.")
+        
+        comparison_report_str = "\n".join(report)
+        print(comparison_report_str)
+        report_file = os.path.join(self.working_dir, "comparison_report.txt")
+        with open(report_file, 'w') as f:
+            f.write(comparison_report_str)
+        print(f"\nComparison report saved to {report_file}")
+
+    def _compare_cfmw(self, cfmws1: List[Dict], cfmws2: List[Dict], report: List[str], key1: str, key2: str):
+        """Compares CXL Fixed Memory Window Structures."""
+        for i, cfmw1 in enumerate(cfmws1):
+            if i < len(cfmws2):
+                cfmw2 = cfmws2[i]
+                if cfmw1 != cfmw2:
+                    report.append(f"❗ [CHANGED] CFMWS #{i+1} has configuration differences:")
+                    for k, v in cfmw1.items():
+                        if k in cfmw2 and cfmw2[k] != v:
+                            report.append(f"    - {k}: {key1} is '{v}', {key2} is '{cfmw2[k]}'")
+            else:
+                report.append(f"❌ [REMOVED] CFMWS #{i+1} found in {key1} is missing from {key2}.")
+
+        if len(cfmws2) > len(cfmws1):
+            for i in range(len(cfmws1), len(cfmws2)):
+                report.append(f"✅ [ADDED] CFMWS #{i+1} found in {key2} but not in {key1}.")
+
+    def _compare_chbs(self, chbs1: List[Dict], chbs2: List[Dict], report: List[str], key1: str, key2: str):
+        """Compares CXL Host Bridge Structures."""
+        for i, chbs_entry1 in enumerate(chbs1):
+            if i < len(chbs2):
+                chbs_entry2 = chbs2[i]
+                if chbs_entry1 != chbs_entry2:
+                    report.append(f"❗ [CHANGED] CHBS #{i+1} has configuration differences:")
+                    for k, v in chbs_entry1.items():
+                        if k in chbs_entry2 and chbs_entry2[k] != v:
+                            report.append(f"    - {k}: {key1} is '{v}', {key2} is '{chbs_entry2[k]}'")
+            else:
+                report.append(f"❌ [REMOVED] CHBS #{i+1} found in {key1} is missing from {key2}.")
+
+        if len(chbs2) > len(chbs1):
+            for i in range(len(chbs1), len(chbs2)):
+                report.append(f"✅ [ADDED] CHBS #{i+1} found in {key2} but not in {key1}.")
+                
+    def _compare_pmtt_devices(self, devices1: List[Dict], devices2: List[Dict], report: List[str], key1: str, key2: str):
+        """Compares PMTT Memory Device Structures."""
+        for i, dev1 in enumerate(devices1):
+            if i < len(devices2):
+                dev2 = devices2[i]
+                if dev1 != dev2:
+                    report.append(f"❗ [CHANGED] PMTT Device #{i+1} has configuration differences:")
+                    for k, v in dev1.items():
+                        if k in dev2 and dev2[k] != v:
+                            report.append(f"    - {k}: {key1} is '{v}', {key2} is '{dev2[k]}'")
+            else:
+                report.append(f"❌ [REMOVED] PMTT Device #{i+1} found in {key1} is missing from {key2}.")
+        
+        if len(devices2) > len(devices1):
+            for i in range(len(devices1), len(devices2)):
+                report.append(f"✅ [ADDED] PMTT Device #{i+1} found in {key2} but not in {key1}.")
+
+    def generate_cedt_tree(self, chbs_data, cfmw_data):
+        lines = []
+        lines.append("Host Bridges")
+        for chbs in chbs_data:
+            lines.append(f"- {chbs['hb_id']}")
+        lines.append("")
+        lines.append("Memory Windows")
+        for i, mw in enumerate(cfmw_data, 1):
+            if mw['interleave_members'] > 0:
+                lines.append(f"- Logical Interleaved Region {i}")
+                lines.append(f"  - Size: {mw['size_str']}")
+                lines.append(f"  - Interleave: {mw['interleave_members'] + 1}-way {'XOR' if mw['interleave_arithmetic'] == 1 else 'Mod-64k'}")
+                lines.append(f"  - Physical Windows:")
+                for target in mw['targets']:
+                    lines.append(f"    - Window from Host Bridge {target} (Size: {mw['size_str']})")
+            else:
+                lines.append(f"- Standalone Memory Window")
+                lines.append(f"  - Size: {mw['size_str']}")
+                lines.append(f"  - Type: {mw['restrictions_decoded']}")
+                lines.append(f"  - Target: Host Bridge {mw['targets'][0]}")
+        return '\n'.join(lines)
+
+    def generate_cedt_graph(self, chbs_data, cfmw_data):
+        lines = []
+        lines.append("+----------------+          +------------------------+")
+        lines.append("| Host Bridges   |          |  Memory Windows        |")
+        lines.append("| (HB UID)       |          +------------------------+")
+        lines.append("+----------------+          |  Logical Regions       |")
+        for i, mw in enumerate(cfmw_data, 1):
+            if mw['interleave_members'] > 0:
+                targets = ', '.join(mw['targets'])
+                lines.append(f"| {targets} +--->|  Region {i}: {mw['size_str']}, {mw['interleave_members'] + 1}-way {'XOR' if mw['interleave_arithmetic'] == 1 else 'Mod-64k'}")
+            else:
+                lines.append(f"| {mw['targets'][0]} +--->|  Standalone: {mw['size_str']}, {mw['restrictions_decoded']}")
+        lines.append("+----------------+          +------------------------+")
+        return '\n'.join(lines)
+
+    def decode_cedt_table(self, dsl_file: str, data_key: str) -> None:
+        """Decodes the CXL Early Discovery Table (CEDT) and stores the data."""
+        print("Starting detailed CXL Early Discovery Table (CEDT) analysis...")
+        txt_file = dsl_file  # Use .dsl file directly
+        if not os.path.exists(txt_file):
+            print(f"Disassembled file not found: {txt_file}")
+            return
+        with open(txt_file, 'r') as f:
+            content = f.read()
+        # Improved regex for robust subtable matching
+        subtable_pattern = re.compile(r'\[(.*?)\]\s+Subtable Type\s+:\s+([0-9A-Fa-f]{2})\s+\[(.*?)\]')
+        subtables = []
+        for match in subtable_pattern.finditer(content):
+            offset = match.group(1)
+            subtable_type = match.group(2)
+            subtable_name = match.group(3)
+            subtables.append((offset, subtable_type, subtable_name))
+        if not subtables:
+            print("No CEDT subtables found in the disassembled file.")
+            if hasattr(self, 'verbose') and self.verbose >= 2:
+                print("\n--- CEDT File Preview (first 40 lines) ---")
+                for i, line in enumerate(content.splitlines()):
+                    if i >= 40:
+                        break
+                    print(line)
+            return
+        
+        # Print summary if verbose >= 1
+        if hasattr(self, 'verbose') and self.verbose >= 1:
+            print(f"Found {len(subtables)} CEDT subtables.")
+            for offset, subtable_type, subtable_name in subtables:
+                print(f"  Offset {offset}: Type {subtable_type} - {subtable_name}")
+        
+        # Regular expressions to find the required sections
+        subtable_pattern = re.compile(r'\[\s*(.*?h).*?\]\s+Subtable Type\s+:\s+(\S+)\s+\[(.*?)\]')
+        
+        # --- Decode Subtables ---
+        chbs_data = []
+        cfmw_data = []
+        xor_data = []
+        for offset, subtable_type, subtable_name in subtables:
+            # Decode CXL Host Bridge Structure
+            if 'Host Bridge' in subtable_name or subtable_type == '00':
+                chbs_id_match = re.search(rf'\[{re.escape(offset)}.*?\].*?Associated host bridge\s+:\s+(\S+)', content, re.DOTALL)
+                if chbs_id_match:
+                    chbs_data.append({"offset": offset, "hb_id": chbs_id_match.group(1)})
+            # Decode CFMWS (Type 01)
+            if 'Fixed Memory Window' in subtable_name or subtable_type == '01':
+                # Find the start index of this subtable
+                start_idx = content.find(f'[{offset}]')
+                # Find the start index of the next subtable
+                next_match = re.search(r'\[([0-9A-Fa-f]+h.*?)\]\s+Subtable Type\s+:', content[start_idx+1:])
+                if next_match:
+                    end_idx = start_idx + 1 + next_match.start()
+                else:
+                    end_idx = len(content)
+                section_content = content[start_idx:end_idx]
+                window_base_match = re.search(r'Window base address\s+:\s+([0-9A-Fa-f]+)', section_content)
+                size_match = re.search(r'Window size\s+:\s+([0-9A-Fa-f]+)', section_content)
+                restrictions_match = re.search(r'Restrictions\s+:\s+([0-9A-Fa-f]+)', section_content)
+                interleave_members_match = re.search(r'Interleave Members\s+:\s+([0-9A-Fa-f]+)', section_content)
+                interleave_arith_match = re.search(r'Interleave Arithmetic\s+:\s+([0-9A-Fa-f]+)', section_content)
+                first_target_match = re.search(r'First Target\s+:\s+([0-9A-Fa-f]+)', section_content)
+                next_targets = re.findall(r'Next Target\s+:\s+([0-9A-Fa-f]+)', section_content)
+                if window_base_match and size_match and restrictions_match and first_target_match:
+                    window_base_hex = window_base_match.group(1)
+                    window_base = int(window_base_hex, 16)
+                    size_hex = size_match.group(1)
+                    size_bytes = int(size_hex, 16)
+                    restrictions_hex = restrictions_match.group(1)
+                    restrictions_val = int(restrictions_hex, 16)
+                    decoded_restrictions = []
+                    for flag_value, flag_name in CXL_RESTRICTIONS.items():
+                        if restrictions_val & flag_value:
+                            decoded_restrictions.append(flag_name)
+                    cfmw_data.append({
+                        "window_base": window_base,
+                        "window_base_hex": window_base_hex,
+                        "size_bytes": size_bytes,
+                        "size_str": f"{size_bytes/1024**3:.2f} GB" if size_bytes < 1024**4 else f"{size_bytes/1024**4:.2f} TB",
+                        "restrictions_hex": restrictions_hex,
+                        "restrictions_decoded": " | ".join(decoded_restrictions),
+                        "interleave_members": int(interleave_members_match.group(1), 16) if interleave_members_match else 0,
+                        "interleave_arithmetic": int(interleave_arith_match.group(1), 16) if interleave_arith_match else 0,
+                        "targets": [first_target_match.group(1)] + next_targets
+                    })
+            # Decode XOR Interleave Math Structure (Type 02)
+            if 'XOR Interleave Math' in subtable_name or subtable_type == '02':
+                section_pattern = re.compile(rf'\[{re.escape(offset)}.*?\](.*?)(?=\[\d{{3,4}}h.*?Subtable Type|\Z)', re.DOTALL)
+                section_match = section_pattern.search(content)
+                if section_match:
+                    section_content = section_match.group(1)
+                    granularity_match = re.search(r'Interleave Granularity\s+:\s+([0-9A-Fa-f]+)', section_content)
+                    xormap_count_match = re.search(r'Xormap List Count\s+:\s+([0-9A-Fa-f]+)', section_content)
+                    xormaps = re.findall(r'(?:First|Next) Xormap\s+:\s+([0-9A-Fa-f]+)', section_content)
+                    xor_data.append({
+                        "offset": offset,
+                        "granularity": granularity_match.group(1) if granularity_match else None,
+                        "xormap_count": int(xormap_count_match.group(1), 16) if xormap_count_match else None,
+                        "xormaps": xormaps
+                    })
+        self.parsed_data[data_key]['CEDT_CHBS'] = chbs_data
+        self.parsed_data[data_key]['CEDT_CFMWS'] = cfmw_data
+        self.parsed_data[data_key]['CEDT_XOR'] = xor_data
+        # Print decoded subtables if verbose
+        if hasattr(self, 'verbose') and self.verbose >= 1:
+            print("\n--- Decoded CXL Host Bridges ---")
+            for chbs in chbs_data:
+                print(chbs)
+            print("\n--- Decoded CXL Fixed Memory Windows ---")
+            for cfmw in cfmw_data:
+                print(cfmw)
+            print("\n--- Decoded CXL XOR Interleave Math Structures ---")
+            for xor in xor_data:
+                print(xor)
+        # Print ASCII art if CFMWS found
+        if cfmw_data:
+            print("\n--- CEDT Memory Window Topology ---")
+            print(self.generate_cedt_ascii_art(cfmw_data))
+        # Write hierarchical tree output
+        tree_output = self.generate_cedt_tree(chbs_data, cfmw_data)
+        tree_file = os.path.join(self.working_dir, f"cedt_tree_{data_key}.txt")
+        with open(tree_file, 'w') as f:
+            f.write(tree_output)
+        print(f"CEDT hierarchical tree written to {tree_file}")
+
+        # Write JSON output for hierarchical tree
+        tree_json = self.generate_cedt_tree_json(chbs_data, cfmw_data)
+        tree_json_file = os.path.join(self.working_dir, f"cedt_tree_{data_key}.json")
+        import json
+        with open(tree_json_file, 'w') as f:
+            json.dump(tree_json, f, indent=2)
+        print(f"CEDT hierarchical tree JSON written to {tree_json_file}")
+    def generate_cedt_tree_json(self, chbs_data, cfmw_data):
+        """
+        Generate a hierarchical JSON structure for CEDT tree, showing parent/child and grouping/interleaving.
+        Host Bridges are parents, Memory Windows are children, grouped by interleave.
+        """
+        # Build a lookup for host bridges
+        hb_lookup = {hb['hb_id']: {"hb_id": hb['hb_id'], "windows": []} for hb in chbs_data}
+        # Assign windows to host bridges
+        for mw in cfmw_data:
+            window_entry = {
+                "window_base": mw.get("window_base_hex", hex(mw.get("window_base", 0))),
+                "size_bytes": mw["size_bytes"],
+                "size_str": mw["size_str"],
+                "restrictions": mw["restrictions_decoded"],
+                "interleave_members": mw["interleave_members"],
+                "interleave_arithmetic": "XOR" if mw["interleave_arithmetic"] == 1 else "Mod-64k",
+                "targets": mw["targets"]
+            }
+            # Grouping: If interleave_members > 0, this window is shared among multiple host bridges
+            for target in mw["targets"]:
+                if target in hb_lookup:
+                    hb_lookup[target]["windows"].append(window_entry)
+        # Build final tree
+        tree = {"host_bridges": list(hb_lookup.values())}
+        return tree
+        # Write simple graph output
+        graph_output = self.generate_cedt_graph(chbs_data, cfmw_data)
+        graph_file = os.path.join(self.working_dir, f"cedt_graph_{data_key}.txt")
+        with open(graph_file, 'w') as f:
+            f.write(graph_output)
+        print(f"CEDT simple graph written to {graph_file}")
+
+    def generate_cedt_ascii_art(self, cfmw_data: List[Dict]) -> str:
+        """Generates an ASCII art diagram for the CFMWS topology."""
+        header = "+----------------+          +--------------------------------------+\n"
+        header += "| Host Bridges   |          |  Memory Windows                      |\n"
+        header += "| (HB UID)       |          +--------------------------------------+\n"
+        
+        body_lines = []
+        hb_uids = set()
+        for data in cfmw_data:
+            for target in data['targets']:
+                hb_uids.add(target)
+        
+        for uid in sorted(list(hb_uids)):
+            body_lines.append(f"| {uid}      |")
+            
+        footer_line = "+----------------+\n"
+        
+        # Build the memory windows part of the diagram
+        windows_lines = []
+        for i, data in enumerate(cfmw_data, 1):
+            windows_lines.append(f"|  Window {i}: {data['size_str'].ljust(20)}|")
+            windows_lines.append(f"|  Type: {data['restrictions_decoded'].ljust(30)}|")
+            windows_lines.append(f"|  Interleave: {data['interleave_members'] + 1}-way ({'XOR' if data['interleave_arithmetic'] == 1 else 'Mod-64k'}){'' if data['interleave_members'] == 0 else ' '*(11-len(str(data['interleave_members'] + 1)))}|")
+            windows_lines.append(f"|  Targets: {', '.join(data['targets']).ljust(30)}|")
+            windows_lines.append("+--------------------------------------+")
+
+        # Combine both sides
+        all_lines = body_lines
+        for i, line in enumerate(windows_lines):
+            if i < len(all_lines):
+                all_lines[i] += f"          {line}"
+            else:
+                all_lines.append(" " * 19 + line)
+
+        return header + "\n".join(all_lines) + "\n" + footer_line
+
+    def decode_slit_table(self, dsl_file: str, data_key: str) -> None:
+        """Decodes the System Locality Information Table (SLIT)."""
+        print("Starting detailed System Locality Information Table (SLIT) analysis...")
+        txt_file = dsl_file  # Use .dsl file directly
+        if not os.path.exists(txt_file):
+            print(f"Disassembled file not found: {txt_file}")
+            return
+            
+        with open(txt_file, 'r') as f:
+            content = f.read()
+            
+        report = [
+            "============================================",
+            "  System Locality Information Table (SLIT)  ",
+            "============================================",
+            f"Source file: {txt_file}"
+        ]
+        
+        # Find number of localities
+        localities_match = re.search(r'Localities\s+:\s+([0-9A-Fa-f]+)', content)
+        if not localities_match:
+            report.append("\nCould not find 'Localities' in SLIT table.")
+            print("\n".join(report))
+            return
+            
+        num_localities = int(localities_match.group(1), 16)
+        report.append(f"\nNumber of Localities: {num_localities}\n")
+        
+        # Find the distance matrix
+        distance_matrix_pattern = r'Locality Distance:\n\n(.*?)Raw Table Data'
+        matrix_match = re.search(distance_matrix_pattern, content, re.DOTALL)
+        
+        matrix_values = []
+        if matrix_match:
+            matrix_str = matrix_match.group(1).strip()
+            matrix_lines = matrix_str.split('\n')
+            for line in matrix_lines:
+                # Remove brackets and split by space
+                values = re.findall(r'(\d+)', line)
+                if values:
+                    matrix_values.append(values)
+                    
+            if len(matrix_values) == num_localities and all(len(row) == num_localities for row in matrix_values):
+                report.append("--- Locality Distance Matrix ---")
+                report.append(self._generate_matrix_ascii_art(matrix_values))
+            else:
+                report.append("Could not parse a valid Locality Distance Matrix.")
+        self.parsed_data[data_key]['SLIT_MATRIX'] = matrix_values
+                
+        final_report = "\n".join(report)
+        print(final_report)
+        report_file = os.path.join(self.working_dir, f"SLIT_report_{data_key}.txt")
+        with open(report_file, 'w') as f:
+            f.write(final_report)
+        print(f"\nDetailed report saved to {report_file}")
+        
+    def _generate_matrix_ascii_art(self, matrix: List[List[str]]) -> str:
+        """Generates a simple ASCII art table for a matrix."""
+        num_cols = len(matrix[0])
+        col_width = 5
+        
+        # Create header
+        header = " " * col_width + "|"
+        for i in range(num_cols):
+            header += f" L{i+1}".ljust(col_width) + "|"
+        
+        separator = "-" * (col_width + 1) + "+" + ("-" * col_width + "+") * num_cols
+        
+        body = []
+        for i, row in enumerate(matrix):
+            line = f" L{i+1}".ljust(col_width) + "|"
+            for val in row:
+                line += f" {val}".ljust(col_width) + "|"
+            body.append(line)
+        
+        return "\n".join([header, separator] + body)
+        
+    def decode_hmat_table(self, dsl_file: str, data_key: str) -> None:
+        """Decodes the Heterogeneous Memory Attribute Table (HMAT)."""
+        print("Starting detailed Heterogeneous Memory Attribute Table (HMAT) analysis...")
+        txt_file = dsl_file  # Use .dsl file directly
+        if not os.path.exists(txt_file):
+            print(f"Disassembled file not found: {txt_file}")
+            return
+        
+        with open(txt_file, 'r') as f:
+            content = f.read()
+        
+        report = [
+            "============================================",
+            " Heterogeneous Memory Attribute Table (HMAT)",
+            "============================================",
+            f"Source file: {txt_file}"
+        ]
+        
+        # Find and decode subtables
+        subtable_pattern = re.compile(r'\[\s*(.*?h).*?\]\s+Subtable Type\s+:\s+(\S+)\s+\[(.*?)\]')
+        subtables = subtable_pattern.findall(content)
+        
+        report.append("\n--- HMAT Subtable Summary ---")
+        for offset, subtable_type, subtable_name in subtables:
+            type_id = int(subtable_type.replace('h', ''), 16)
+            decoded_type = HMAT_SUBTABLE_TYPES.get(type_id, "Unknown Subtable Type")
+            report.append(f"Offset {offset}: {decoded_type} (Type {subtable_type})")
+            
+        # Example decoder for Type 0
+        type0_sections = re.finditer(r'\[\s*(.*?h).*?\]\s+Subtable Type\s+:\s+00(.*?)'
+                                     r'(?=\[\s*(.*?h).*?\]\s+Subtable Type\s+|\Z)', content, re.DOTALL)
+        
+        for i, match in enumerate(type0_sections):
+            section_content = match.group(2)
+            report.append(f"\n--- Memory Proximity Domain Attribute Structure #{i+1} ---")
+            
+            # Extract key fields
+            domain_match = re.search(r'Memory Proximity Domain\s+:\s+(\S+)', section_content)
+            mem_if_match = re.search(r'Memory Sideband Interface Type\s+:\s+(\S+)', section_content)
+            access_latency_match = re.search(r'Access Latency\s+:\s+(\S+)', section_content)
+            read_latency_match = re.search(r'Read Latency\s+:\s+(\S+)', section_content)
+            read_bandwidth_match = re.search(r'Read Bandwidth\s+:\s+(\S+)', section_content)
+            
+            if domain_match: report.append(f"  - Memory Proximity Domain: {domain_match.group(1)}")
+            if mem_if_match: report.append(f"  - Memory Sideband Interface Type: {mem_if_match.group(1)}")
+            if access_latency_match: report.append(f"  - Access Latency: {int(access_latency_match.group(1), 16)} fs")
+            if read_latency_match: report.append(f"  - Read Latency: {int(read_latency_match.group(1), 16)} fs")
+            if read_bandwidth_match: report.append(f"  - Read Bandwidth: {int(read_bandwidth_match.group(1), 16)} MB/s")
+
+        # Save the full report
+        final_report = "\n".join(report)
+        print(final_report)
+        report_file = os.path.join(self.working_dir, f"HMAT_report_{data_key}.txt")
+        with open(report_file, 'w') as f:
+            f.write(final_report)
+        print(f"\nDetailed report saved to {report_file}")
+            
+    def decode_pmtt_table(self, dsl_file: str, data_key: str) -> None:
+        """Decodes the Platform Memory Topology Table (PMTT)."""
+        print("Starting detailed Platform Memory Topology Table (PMTT) analysis...")
+        txt_file = dsl_file  # Use .dsl file directly
+        if not os.path.exists(txt_file):
+            print(f"Disassembled file not found: {txt_file}")
+            return
+            
+        with open(txt_file, 'r') as f:
+            content = f.read()
+
+        report = [
+            "============================================",
+            "Platform Memory Topology Table (PMTT) Report",
+            "============================================",
+            f"Source file: {txt_file}"
+        ]
+
+        subtable_pattern = re.compile(r'\[\s*(.*?h).*?\]\s+Subtable Type\s+:\s+(\S+)\s+\[(.*?)\]')
+        subtables = subtable_pattern.findall(content)
+        
+        pmtt_mem_devices = []
+        if not subtables:
+            report.append("\nNo PMTT subtables found.")
+            print("\n".join(report))
+            return
+            
+        for offset, subtable_type, subtable_name in subtables:
+            type_id = int(subtable_type, 16)
+            decoded_type = PMTT_SUBTABLE_TYPES.get(type_id, "Unknown Subtable Type")
+            report.append(f"\n--- Subtable at Offset {offset}: {decoded_type} ---")
+            
+            # Use regex to find the content of this specific subtable
+            subtable_content_pattern = re.compile(r'\[\s*'+ re.escape(offset) + r'h.*?\]\s+Subtable Type\s+.*?\](.*?)'
+                                                  r'(?=\[\s*(.*?h).*?\]\s+Subtable Type\s+|\Z)', re.DOTALL)
+            subtable_content_match = subtable_content_pattern.search(content)
+            
+            if subtable_content_match:
+                section_content = subtable_content_match.group(1)
+                
+                if type_id == 0: # Memory Controller Structure
+                    controller_domain_match = re.search(r'Memory Proximity Domain\s+:\s+(\S+)', section_content)
+                    controller_id_match = re.search(r'Memory Controller Id\s+:\s+(\S+)', section_content)
+                    if controller_domain_match: report.append(f"  - Proximity Domain: {controller_domain_match.group(1)}")
+                    if controller_id_match: report.append(f"  - Controller ID: {controller_id_match.group(1)}")
+                    
+                elif type_id == 1: # Memory Device Structure
+                    device_type_match = re.search(r'Memory Device Type\s+:\s+(\S+)', section_content)
+                    device_attributes_match = re.search(r'Memory Attributes\s+:\s+(\S+)', section_content)
+                    device_size_match = re.search(r'Memory Device Size\s+:\s+(\S+)', section_content)
+                    
+                    device_data = {}
+                    if device_type_match:
+                        type_id = int(device_type_match.group(1).replace('h', ''), 16)
+                        decoded_type = PMTT_DEVICE_TYPES.get(type_id, "Unknown")
+                        report.append(f"  - Device Type: {decoded_type} (Type {type_id})")
+                        device_data['device_type'] = type_id
+                        
+                    if device_attributes_match:
+                        attributes_val = int(device_attributes_match.group(1).replace('h', ''), 16)
+                        decoded_attributes = []
+                        for flag_value, flag_name in PMTT_ATTRIBUTES.items():
+                            if attributes_val & flag_value:
+                                decoded_attributes.append(flag_name)
+                        report.append(f"  - Attributes: {' | '.join(decoded_attributes)}")
+                        
+                    if device_size_match:
+                        size_hex = device_size_match.group(1).replace('h','')
+                        size_bytes = int(size_hex, 16)
+                        size_str = f"{size_bytes/1024**3:.2f} GB" if size_bytes < 1024**4 else f"{size_bytes/1024**4:.2f} TB"
+                        report.append(f"  - Device Size: {size_str} ({size_bytes} bytes)")
+                        device_data['size_bytes'] = size_bytes
+                    
+                    if device_data:
+                        pmtt_mem_devices.append(device_data)
+        self.parsed_data[data_key]['PMTT_MEMDEVICES'] = pmtt_mem_devices
+        
+        final_report = "\n".join(report)
+        print(final_report)
+        report_file = os.path.join(self.working_dir, f"PMTT_report_{data_key}.txt")
+        with open(report_file, 'w') as f:
+            f.write(final_report)
+        print(f"\nDetailed report saved to {report_file}")
+        
+def main():
+
+    parser = argparse.ArgumentParser(description="A tool to decode and analyze ACPI tables, with a focus on CXL configurations.")
+    parser.add_argument("--acpidump-path", default="acpidump", help="Path to the acpidump binary.")
+    parser.add_argument("--iasl-path", default="iasl", help="Path to the iasl (ACPI Source Language) compiler/disassembler binary.")
+    parser.add_argument("--tables", nargs='+', default=None, help="List of ACPI tables to process (e.g., 'CEDT BGRT'). Defaults to all tables.")
+    parser.add_argument("--working-dir", default="acpi_workdir", help="Working directory for all output files.")
+    parser.add_argument("--compare", nargs=2, metavar=('FILE1', 'FILE2'), help="Two ACPI dump files for comparison.")
+    parser.add_argument("-v", "--verbose", action="count", default=0, help="Increase verbosity level (-v, -vv, -vvv)")
+
+    args = parser.parse_args()
+
+    decoder = ACPIDecoder(args.acpidump_path, args.iasl_path, args.working_dir)
+    decoder.verbose = args.verbose
+    decoder.setup_workspace()
+
+    if args.compare:
+        print("Running comparison mode...")
+        compare_dump1 = args.compare[0]
+        compare_dump2 = args.compare[1]
+
+        tables_to_process_1 = decoder.get_table_list(compare_dump1)
+        print(f"Found {len(tables_to_process_1)} tables in {compare_dump1}.")
+        if decoder.verbose:
+            print("Tables:", ", ".join(tables_to_process_1))
+        decoder.process_tables(tables_to_process_1, compare_dump1, "dump1")
+        decoder.run_validation_checks("dump1")
+
+        tables_to_process_2 = decoder.get_table_list(compare_dump2)
+        print(f"Found {len(tables_to_process_2)} tables in {compare_dump2}.")
+        if decoder.verbose:
+            print("Tables:", ", ".join(tables_to_process_2))
+        decoder.process_tables(tables_to_process_2, compare_dump2, "dump2")
+        decoder.run_validation_checks("dump2")
+
+        decoder.compare_dumps("dump1", "dump2")
+
+    else:
+        output_file = os.path.join(decoder.working_dir, "acpi.dump")
+        decoder.dump_acpi_tables(output_file)
+
+        tables_to_process = args.tables
+        if not tables_to_process:
+            tables_to_process = decoder.get_table_list(output_file)
+            print(f"Found {len(tables_to_process)} tables in {output_file}.")
+            if decoder.verbose:
+                print("Tables:", ", ".join(tables_to_process))
+
+        decoder.process_tables(tables_to_process, output_file, "single")
+        decoder.run_validation_checks("single")
+    def __init__(self, acpidump_path: str, iasl_path: str, working_dir: str):
+        self.verbose = 0
+
+if __name__ == "__main__":
+    main()
