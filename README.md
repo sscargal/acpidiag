@@ -1,6 +1,4 @@
-# acpidiag
-
-**ACPI Diagnostic and Decoder Utility for CXL and Memory Topology Tables**
+# acpidiag - ACPI Diagnostic and Decoder Utility for CXL and Memory Topology Tables
 
 ## Overview
 
@@ -11,7 +9,7 @@
 - Python 3.6+
 - `acpidump`, `acpixtract`, and `iasl` binaries available in your PATH or specified via arguments.
 - Root privileges (for ACPI table access).
-- **Important:** This script expects the latest version of `acpidump` to be available. The version packaged with most Linux distributions is often too old to work with CXL tables. For instructions on building the latest version from source, see:
+- **Important:** This script expects the latest version of `acpidump`, `acpixtract`, `iasl` to be available. The version packaged with most Linux distributions is often too old to work with CXL tables. For instructions on building the latest version from source, see:
   - [How to build acpidump from source and use it to debug complex CXL and PCI issues](https://stevescargall.com/blog/2025/08/how-to-build-acpidump-from-source-and-use-it-to-debug-complex-cxl-and-pci-issues/)
 
 ## References
@@ -36,26 +34,48 @@ Clone the repository and ensure dependencies are available:
 ```bash
 git clone https://github.com/sscargal/acpidiag.git
 cd acpidiag
-# Ensure acpidump, acpixtract, iasl are installed and accessible
+# Ensure acpidump, acpixtract, iasl are installed and accessible in your $PATH env.
 ```
 
 ## Usage
 
 ```bash
-sudo ./acpidiag --tables CEDT,SLIT,HMAT,PMTT
+usage: acpidiag [-h] [--acpidump-path ACPIDUMP_PATH] [--iasl-path IASL_PATH] [--tables TABLES [TABLES ...]] [--working-dir WORKING_DIR] [--compare FILE1 FILE2] [-v]
+
+A tool to decode and analyze ACPI tables, with a focus on CXL configurations.
+
+options:
+  -h, --help            show this help message and exit
+  --acpidump-path ACPIDUMP_PATH
+                        Path to the acpidump binary.
+  --iasl-path IASL_PATH
+                        Path to the iasl (ACPI Source Language) compiler/disassembler binary.
+  --tables TABLES [TABLES ...]
+                        List of ACPI tables to process (e.g., 'CEDT BGRT'). Defaults to all tables.
+  --working-dir WORKING_DIR
+                        Working directory for all output files. Defaults to `acpi_workdir`.
+  --compare FILE1 FILE2
+                        Compare ACPI dump files FILE1 vs FILE2. Similar to `diff`.
+  -v, --verbose         Increase verbosity level (-v, -vv, -vvv)
 ```
 
-### Options
+**Examples**
 
-- `--tables <TABLES>`: Comma-separated list of ACPI tables to process (e.g., CEDT, SLIT).
-- `--acpidump <PATH>`: Path to `acpidump` binary (optional).
-- `--iasl <PATH>`: Path to `iasl` binary (optional).
-- `--workdir <DIR>`: Working directory for output files (default: `acpi_workdir`).
-- `--verbose`: Increase output verbosity.
+1. Dump all tables and automatically process the tables with decoders (CEDT, SLIT, HMAT, and PMTT)
+
+    ```bash
+    sudo ./acpidiag
+    ```
+
+2. Dump and analyze the CEDT table
+
+    ```bash
+    sudo ./acpidiag --tables CEDT
+    ```
 
 ## Output
 
-- Disassembled ACPI tables in the working directory.
+- Disassembled ACPI tables in the working directory (`acpi_workdir`)
 - Topology visualizations:
   - `cedt_tree_<key>.txt`: Hierarchical tree (text).
   - `cedt_graph_<key>.txt`: Simple graph (text).
@@ -68,6 +88,8 @@ sudo ./acpidiag --tables CEDT,SLIT,HMAT,PMTT
 1. Run the tool with root privileges to extract and decode tables.
 2. Review the output files in `acpi_workdir/` for topology and validation results.
 3. Use the JSON output for integration with other tools or visualization frameworks.
+
+Example: The following shows how to analyze the CEDT table. 
 
 ## Validation Checks
 
